@@ -1,93 +1,176 @@
+"""
+Módulo para consultar boletines judiciales y enviar alertas por Telegram.
+"""
+
+import boto3
 import requests
 from bs4 import BeautifulSoup
-from unidecode import unidecode
-import mensaje
-import pytz
 from datetime import datetime, timedelta
-import boto3
+from unidecode import unidecode
+import pytz
 
-dynamodb = boto3.resource('dynamodb')
-table = dynamodb.Table('boletin')
+import mensaje
 
-def consulta_boletin(distrito,nombre):
-    zona_horaria_mexico = pytz.timezone("America/Mexico_City")
+# Configuración de DynamoDB
+DYNAMODB_RESOURCE = boto3.resource('dynamodb')
+TABLE = DYNAMODB_RESOURCE.Table('boletin')  # type: ignore
+
+# Constantes
+BASE_URL = "http://sica.tsjmorelos2.gob.mx/boletin"
+CONSULTA_URL = f"{BASE_URL}/DT/dat_consulta.php"
+BOLETIN_URL = f"{BASE_URL}/boletinjudicial.php"
+ZONA_HORARIA = "America/Mexico_City"
+DIAS_BUSQUEDA = 26
+DIAS_VALIDACION = 6
+USER_AGENT = "insomnia/2023.5.8"
+
+
+def consulta_boletin(distrito: int, nombre: str) -> None:
+    """
+    Consulta el boletín judicial para un distrito y nombre específicos.
+    
+    Args:
+        distrito: Número del distrito judicial
+        nombre: Nombre de la persona a buscar
+    """
+    zona_horaria_mexico = pytz.timezone(ZONA_HORARIA)
     fecha_actual = datetime.now(zona_horaria_mexico)
-    fecha_menos_tres_dias = fecha_actual - timedelta(days=26)
+    fecha_inicio = fecha_actual - timedelta(days=DIAS_BUSQUEDA)
 
-    url = "http://sica.tsjmorelos2.gob.mx/boletin/DT/dat_consulta.php"
+    payload = _construir_payload(distrito, fecha_inicio, fecha_actual)
+    headers = _construir_headers()
+    cadena_busqueda = unidecode(nombre).lower()
+    
+    try:
+        response = requests.post(CONSULTA_URL, data=payload, headers=headers)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.text, 'html.parser')
+        tabla = soup.find('table')
+        
+        if not tabla:
+            print(f"No se encontró tabla para distrito {distrito}")
+            return
+            
+        _procesar_tabla(tabla, cadena_busqueda, payload)
+        
+    except requests.RequestException as e:
+        print(f"Error en la consulta HTTP: {e}")
+    except Exception as e:
+        print(f"Error inesperado: {e}")
 
-    payload = f"opcion=area&start={fecha_menos_tres_dias.strftime('%Y-%m-%d')}&end={fecha_actual.strftime('%Y-%m-%d')}&dato=&distritos={distrito}"
-    headers = {
+
+def _construir_payload(distrito: int, fecha_inicio: datetime, fecha_fin: datetime) -> str:
+    """Construye el payload para la consulta HTTP."""
+    return (
+        f"opcion=area&start={fecha_inicio.strftime('%Y-%m-%d')}"
+        f"&end={fecha_fin.strftime('%Y-%m-%d')}&dato=&distritos={distrito}"
+    )
+
+
+def _construir_headers() -> dict:
+    """Construye los headers para la consulta HTTP."""
+    return {
         "Content-Type": "application/x-www-form-urlencoded",
-        "User-Agent": "insomnia/2023.5.8"
-    }   
-    cadena_a_buscar = unidecode(nombre).lower()
-    response = requests.request("POST", url, data=payload, headers=headers)
-    soup = BeautifulSoup(response.text, 'html.parser')
-    #soup = BeautifulSoup(response.text, "html.parser").get_text(separator=" ", strip=True)
-    tabla = soup.find('table')
+        "User-Agent": USER_AGENT
+    }
+
+
+def _procesar_tabla(tabla, cadena_busqueda: str, payload: str) -> None:
+    """Procesa la tabla HTML buscando coincidencias."""
     for fila in tabla.find_all('tr'):
         for celda in fila.find_all('td'):
-            texto = celda.get_text(separator=" ", strip=True)
-            texto = unidecode(texto).lower()
-            posicion = texto.find(cadena_a_buscar)
-            if posicion != -1:
-                i = 0
-                for parrafo in celda.find_all('p'):
-                    texto = parrafo.get_text(separator=" ", strip=True)
-                    texto = unidecode(texto).lower()
-                    posicion = texto.find(cadena_a_buscar)                
-                    if posicion != -1:
-                        mensaje_texto = parrafo.get_text(separator=" ", strip=True)  #f"posible coincidencia '{cadena_a_buscar}' fue encontrada {posicion}"
-                        mensaje_texto = f"{mensaje_texto} 'http://sica.tsjmorelos2.gob.mx/boletin/boletinjudicial.php' {payload}"
-                        texto = save_and_validate_record(texto,mensaje_texto)
-                        if texto != None:
-                            mensaje.sendAlert(mensaje_texto)
-                    i= i +1 
+            texto_celda = celda.get_text(separator=" ", strip=True)
+            texto_normalizado = unidecode(texto_celda).lower()
+            
+            if cadena_busqueda in texto_normalizado:
+                _procesar_celda_con_coincidencia(celda, cadena_busqueda, payload)
 
-def save_and_validate_record(texto,mensaje_texto):
-    # Extrae la fecha del registro o usa la fecha actual
+
+def _procesar_celda_con_coincidencia(celda, cadena_busqueda: str, payload: str) -> None:
+    """Procesa una celda que contiene una coincidencia."""
+    for parrafo in celda.find_all('p'):
+        texto_parrafo = parrafo.get_text(separator=" ", strip=True)
+        texto_normalizado = unidecode(texto_parrafo).lower()
+        
+        if cadena_busqueda in texto_normalizado:
+            mensaje_texto = _construir_mensaje(parrafo, payload)
+            texto_guardado = save_and_validate_record(texto_normalizado, mensaje_texto)
+            
+            if texto_guardado is not None:
+                mensaje.sendAlert(mensaje_texto)
+
+
+def _construir_mensaje(parrafo, payload: str) -> str:
+    """Construye el mensaje de alerta."""
+    texto_original = parrafo.get_text(separator=" ", strip=True)
+    return f"{texto_original} '{BOLETIN_URL}' {payload}"
+
+
+def save_and_validate_record(texto: str, mensaje_texto: str) -> str | None:
+    """
+    Guarda y valida un registro en DynamoDB.
+    
+    Args:
+        texto: Texto normalizado del registro
+        mensaje_texto: Mensaje completo a guardar
+        
+    Returns:
+        str: El texto si se guardó exitosamente, None si ya existe
+    """
     current_date = datetime.now()
-    record_key = texto  # O usa una parte única de record para crear la clave primaria
+    record_key = texto
     
-    # Buscar el registro en DynamoDB
-    response = table.get_item(Key={'RecordKey': record_key})
-    
-    # Si el registro existe
-    if 'Item' in response:
-        stored_timestamp = datetime.strptime(response['Item']['Timestamp'], '%Y-%m-%d %H:%M:%S')
+    try:
+        response = TABLE.get_item(Key={'RecordKey': record_key})
         
-        # Validar si el registro tiene menos de 6 días
-        if (current_date - stored_timestamp) < timedelta(days=6):
-            print("Registro ya existe y tiene menos de 3 días.")
-            return
-        
-        # Si el registro es más antiguo, actualizar
-        print("Actualizando registro antiguo.")
-    else:
-        print("Guardando nuevo registro.")
+        if 'Item' in response:
+            stored_timestamp = datetime.strptime(
+                response['Item']['Timestamp'], 
+                '%Y-%m-%d %H:%M:%S'
+            )
+            
+            if (current_date - stored_timestamp) < timedelta(days=DIAS_VALIDACION):
+                print("Registro ya existe y tiene menos de 6 días.")
+                return None
+            
+            print("Actualizando registro antiguo.")
+        else:
+            print("Guardando nuevo registro.")
 
-    # Guardar o actualizar el registro con la fecha actual
-    table.put_item(
-        Item={
-            'RecordKey': record_key,
-            'Timestamp': current_date.strftime('%Y-%m-%d %H:%M:%S'),
-            'mensaje_texto': mensaje_texto
-        }
-    ) 
-    return texto                                  
+        TABLE.put_item(
+            Item={
+                'RecordKey': record_key,
+                'Timestamp': current_date.strftime('%Y-%m-%d %H:%M:%S'),
+                'mensaje_texto': mensaje_texto
+            }
+        )
+        return texto
+        
+    except Exception as e:
+        print(f"Error al guardar en DynamoDB: {e}")
+        return None
+
 
 def lambda_handler(event, context):
-    zona_horaria_mexico = pytz.timezone("America/Mexico_City")
-    fecha = datetime.now(zona_horaria_mexico)
-    nombre  = "Paola Samantha Dominguez Melendez"
-    consulta_boletin(1,nombre)
-    consulta_boletin(9,nombre)
-    nombre  = "Juan Amador Mojica"
-    consulta_boletin(1,nombre)
-    consulta_boletin(9,nombre)
+    """
+    Handler principal para AWS Lambda.
     
-        
+    Args:
+        event: Evento de AWS Lambda
+        context: Contexto de AWS Lambda
+    """
+    nombres_busqueda = [
+        "Paola Samantha Dominguez Melendez",
+        "Juan Amador Mojica"
+    ]
+    
+    distritos = [1, 9]
+    
+    for nombre in nombres_busqueda:
+        for distrito in distritos:
+            consulta_boletin(distrito, nombre)
 
 
-__main__ = lambda_handler(None,None)
+if __name__ == "__main__":
+    lambda_handler(None, None)
